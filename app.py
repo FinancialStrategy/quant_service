@@ -12,7 +12,7 @@ from pypfopt.efficient_frontier import EfficientFrontier, EfficientCVaR, Efficie
 from pypfopt.hierarchical_portfolio import HRPOpt
 from pypfopt.cla import CLA
 
-app = FastAPI(title='MK PyPortfolioOpt Service', version='0.10.5')
+app = FastAPI(title='MK PyPortfolioOpt Service', version='0.10.6')
 
 QUANT_SERVICE_SECRET = os.getenv('QUANT_SERVICE_SECRET', '').strip()
 
@@ -133,6 +133,90 @@ def _performance(weights: Dict[str, float], mu: pd.Series, cov: pd.DataFrame, rf
     return {'expected_return': er, 'volatility': vol, 'sharpe': sharpe}
 
 
+
+
+def _exact_min_vol(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: OptimizeRequest):
+    ef = EfficientFrontier(mu, cov, weight_bounds=bounds)
+    _apply_factor_constraints(ef, req, list(mu.index))
+    ef.min_volatility()
+    weights = dict(ef.clean_weights())
+    return {'weights': weights, 'performance': _performance(weights, mu, cov, rf)}
+
+
+def _exact_max_sharpe(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: OptimizeRequest):
+    ef = EfficientFrontier(mu, cov, weight_bounds=bounds)
+    _apply_factor_constraints(ef, req, list(mu.index))
+    if req.l2_gamma > 0:
+        ef.add_objective(objective_functions.L2_reg, gamma=req.l2_gamma)
+    ef.max_sharpe(risk_free_rate=rf)
+    weights = dict(ef.clean_weights())
+    return {'weights': weights, 'performance': _performance(weights, mu, cov, rf)}
+
+
+def _black_litterman_benchmark(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: OptimizeRequest):
+    if not req.absolute_views:
+        return None
+    bad = [k for k in req.absolute_views if k not in mu.index]
+    if bad:
+        return None
+    bl = BlackLittermanModel(cov, pi=mu, absolute_views=req.absolute_views)
+    bl_mu = bl.bl_returns()
+    bl_cov = bl.bl_cov()
+    ef = EfficientFrontier(bl_mu, bl_cov, weight_bounds=bounds)
+    _apply_factor_constraints(ef, req, list(bl_mu.index))
+    if req.l2_gamma > 0:
+        ef.add_objective(objective_functions.L2_reg, gamma=req.l2_gamma)
+    ef.max_sharpe(risk_free_rate=rf)
+    weights = dict(ef.clean_weights())
+    return {'weights': weights, 'performance': _performance(weights, bl_mu, bl_cov, rf)}
+
+
+def _benchmarks(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: OptimizeRequest):
+    out = {}
+    try:
+        out['min_volatility'] = _exact_min_vol(mu, cov, bounds, rf, req)
+    except Exception as exc:
+        out['min_volatility_error'] = str(exc)
+    try:
+        out['max_sharpe'] = _exact_max_sharpe(mu, cov, bounds, rf, req)
+    except Exception as exc:
+        out['max_sharpe_error'] = str(exc)
+    try:
+        rp = _risk_parity_weights(cov, req)
+        out['risk_parity'] = {'weights': rp, 'performance': _performance(rp, mu, cov, rf)}
+    except Exception as exc:
+        out['risk_parity_error'] = str(exc)
+    try:
+        bl = _black_litterman_benchmark(mu, cov, bounds, rf, req)
+        if bl is not None:
+            out['black_litterman'] = bl
+    except Exception as exc:
+        out['black_litterman_error'] = str(exc)
+    return out
+
+
+def _constraint_diagnostics(weights: Dict[str, float], req: OptimizeRequest, tickers: List[str]):
+    tol = 5e-4
+    lower = float(req.lower_bound)
+    upper = float(req.upper_bound)
+    binding_lower = [t for t in tickers if abs(float(weights.get(t, 0.0)) - lower) <= tol]
+    binding_upper = [t for t in tickers if abs(float(weights.get(t, 0.0)) - upper) <= tol]
+    factor_rows = []
+    for fc in req.factor_constraints:
+        vals = np.array([float(fc.loadings[t]) for t in tickers], dtype=float)
+        w = np.array([float(weights.get(t, 0.0)) for t in tickers], dtype=float)
+        exposure = float(w @ vals)
+        binding = abs(exposure - float(fc.lower)) <= 1e-3 or abs(exposure - float(fc.upper)) <= 1e-3
+        factor_rows.append({'factor': fc.factor, 'exposure': exposure, 'lower': float(fc.lower), 'upper': float(fc.upper), 'binding': bool(binding)})
+    return {
+        'solver_status': 'optimal',
+        'lower_bound': lower,
+        'upper_bound': upper,
+        'binding_lower': binding_lower,
+        'binding_upper': binding_upper,
+        'factor_constraints': factor_rows,
+    }
+
 def _scipy_constraints(req: OptimizeRequest, tickers: List[str]):
     cons=[{'type':'eq','fun':lambda w: float(np.sum(w)-1.0)}]
     for fc in req.factor_constraints:
@@ -204,7 +288,7 @@ def _frontier(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: Optimize
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'engine': 'PyPortfolioOpt', 'version': '0.10.5', 'auth_required': bool(QUANT_SERVICE_SECRET)}
+    return {'ok': True, 'engine': 'PyPortfolioOpt', 'version': '0.10.6', 'auth_required': bool(QUANT_SERVICE_SECRET)}
 
 
 @app.post('/optimize')
@@ -313,5 +397,7 @@ def optimize(req: OptimizeRequest, authorization: Optional[str] = Header(default
         'performance': perf,
         'expected_returns': {k: float(v) for k,v in mu.items()},
         'frontier': _frontier(mu, cov, bounds, req.risk_free_rate, req),
-        'factor_exposure': _factor_exposure(weights, req.factor_constraints, list(mu.index))
+        'factor_exposure': _factor_exposure(weights, req.factor_constraints, list(mu.index)),
+        'benchmarks': _benchmarks(mu, cov, bounds, req.risk_free_rate, req),
+        'constraint_diagnostics': _constraint_diagnostics(weights, req, list(mu.index))
     }
