@@ -12,7 +12,7 @@ from pypfopt.efficient_frontier import EfficientFrontier, EfficientCVaR, Efficie
 from pypfopt.hierarchical_portfolio import HRPOpt
 from pypfopt.cla import CLA
 
-app = FastAPI(title='MK PortfolioOPTIM Service', version='0.11.4.1')
+app = FastAPI(title='MK PortfolioOPTIM Service', version='0.11.4.2')
 
 QUANT_SERVICE_SECRET = os.getenv('QUANT_SERVICE_SECRET', '').strip()
 
@@ -133,55 +133,91 @@ def _performance(weights: Dict[str, float], mu: pd.Series, cov: pd.DataFrame, rf
     return {'expected_return': er, 'volatility': vol, 'sharpe': sharpe}
 
 
+def _raw_optimizer_weights(opt, tickers: List[str]) -> Dict[str, float]:
+    """Return solver weights without display rounding.
+
+    clean_weights() is useful for presentation, but it rounds small positions and can
+    make the same portfolio show slightly different return/volatility/Sharpe values
+    in different UI panels.  The API therefore keeps the raw solver vector as the
+    canonical portfolio definition and leaves formatting to the frontend.
+    """
+    raw = getattr(opt, 'weights', None)
+    if raw is None:
+        cleaned = opt.clean_weights()
+        return {t: float(cleaned.get(t, 0.0)) for t in tickers}
+    arr = np.asarray(raw, dtype=float).reshape(-1)
+    if len(arr) != len(tickers):
+        cleaned = opt.clean_weights()
+        return {t: float(cleaned.get(t, 0.0)) for t in tickers}
+    arr[np.abs(arr) < 1e-12] = 0.0
+    total = float(arr.sum())
+    if abs(total) > 1e-12:
+        arr = arr / total
+    return {t: float(v) for t, v in zip(tickers, arr)}
+
+
+def _benchmark_record(weights: Dict[str, float], mu: pd.Series, cov: pd.DataFrame, rf: float,
+                      optimization_performance: Optional[Dict[str, float]] = None, **extra):
+    common = _performance(weights, mu, cov, rf)
+    out = {
+        'weights': weights,
+        'performance': common,
+        'common_performance': common,
+    }
+    if optimization_performance is not None:
+        out['optimization_performance'] = optimization_performance
+    out.update(extra)
+    return out
 
 
 def _exact_min_vol(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: OptimizeRequest):
     ef = EfficientFrontier(mu, cov, weight_bounds=bounds)
     _apply_factor_constraints(ef, req, list(mu.index))
     ef.min_volatility()
-    weights = dict(ef.clean_weights())
-    return {'weights': weights, 'performance': _performance(weights, mu, cov, rf)}
+    weights = _raw_optimizer_weights(ef, list(mu.index))
+    return _benchmark_record(weights, mu, cov, rf)
 
 
 def _exact_max_sharpe(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: OptimizeRequest):
-    # Pure constrained tangency portfolio. Deliberately exclude L2 regularization:
-    # once an auxiliary objective is added, the selected portfolio is no longer
-    # guaranteed to be the geometric CML/frontier tangency point.
+    # Pure constrained tangency portfolio. Deliberately exclude L2 regularization.
     ef = EfficientFrontier(mu, cov, weight_bounds=bounds)
     _apply_factor_constraints(ef, req, list(mu.index))
     ef.max_sharpe(risk_free_rate=rf)
-    # Use the solver's unrounded portfolio performance for the geometric tangency
-    # coordinates. clean_weights() is retained only for display/allocation output;
-    # recomputing performance from rounded weights can move the marker off frontier.
-    ret, vol, sh = ef.portfolio_performance(risk_free_rate=rf)
-    weights = dict(ef.clean_weights())
-    return {
-        'weights': weights,
-        'performance': {
-            'expected_return': float(ret),
-            'volatility': float(vol),
-            'sharpe': float(sh),
+    weights = _raw_optimizer_weights(ef, list(mu.index))
+    solver_ret, solver_vol, solver_sh = ef.portfolio_performance(risk_free_rate=rf)
+    return _benchmark_record(
+        weights, mu, cov, rf,
+        optimization_performance={
+            'expected_return': float(solver_ret),
+            'volatility': float(solver_vol),
+            'sharpe': float(solver_sh),
         },
-    }
+    )
 
 
 def _black_litterman_benchmark(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: OptimizeRequest):
     if not req.absolute_views:
-        return None
+        raise ValueError('No Black-Litterman absolute views supplied.')
     bad = [k for k in req.absolute_views if k not in mu.index]
     if bad:
-        return None
+        raise ValueError('Black-Litterman view assets are not in the selected universe: ' + ', '.join(bad))
     bl = BlackLittermanModel(cov, pi=mu, absolute_views=req.absolute_views)
     bl_mu = bl.bl_returns()
     bl_cov = bl.bl_cov()
     ef = EfficientFrontier(bl_mu, bl_cov, weight_bounds=bounds)
     _apply_factor_constraints(ef, req, list(bl_mu.index))
-    # Comparison benchmark is intentionally unregularized so Maximum Sharpe,
-    # Minimum Volatility, Risk Parity and Black-Litterman are not mixed with
-    # different L2 penalties. The selected BL strategy still honors req.l2_gamma.
+    # Comparison benchmark is intentionally unregularized.  Optimization occurs on
+    # the BL posterior, while reported comparison metrics are re-evaluated on the
+    # same base mu/cov used by every other strategy.
     ef.max_sharpe(risk_free_rate=rf)
-    weights = dict(ef.clean_weights())
-    return {'weights': weights, 'performance': _performance(weights, bl_mu, bl_cov, rf)}
+    weights = _raw_optimizer_weights(ef, list(bl_mu.index))
+    posterior_perf = _performance(weights, bl_mu, bl_cov, rf)
+    return _benchmark_record(
+        weights, mu, cov, rf,
+        optimization_performance=posterior_perf,
+        posterior_returns={k: float(v) for k, v in bl_mu.items()},
+        comparison_note='Optimized on Black-Litterman posterior; scored on common base model.',
+    )
 
 
 def _benchmarks(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: OptimizeRequest):
@@ -196,20 +232,25 @@ def _benchmarks(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: Optimi
         out['max_sharpe_error'] = str(exc)
     try:
         rp = _risk_parity_weights(cov, req)
-        out['risk_parity'] = {'weights': rp, 'performance': _performance(rp, mu, cov, rf)}
+        out['risk_parity'] = _benchmark_record(rp, mu, cov, rf)
     except Exception as exc:
         out['risk_parity_error'] = str(exc)
     try:
-        bl = _black_litterman_benchmark(mu, cov, bounds, rf, req)
-        if bl is not None:
-            out['black_litterman'] = bl
+        out['black_litterman'] = _black_litterman_benchmark(mu, cov, bounds, rf, req)
     except Exception as exc:
         out['black_litterman_error'] = str(exc)
+
+    # Constraint diagnostics are attached to each benchmark so the UI can clearly
+    # distinguish pure Tangency bindings from a selected regularized solution.
+    for key in ('min_volatility', 'max_sharpe', 'risk_parity', 'black_litterman'):
+        rec = out.get(key)
+        if isinstance(rec, dict) and rec.get('weights'):
+            rec['constraint_diagnostics'] = _constraint_diagnostics(rec['weights'], req, list(mu.index))
     return out
 
 
 def _constraint_diagnostics(weights: Dict[str, float], req: OptimizeRequest, tickers: List[str]):
-    tol = 5e-4
+    tol = 1e-5
     lower = float(req.lower_bound)
     upper = float(req.upper_bound)
     binding_lower = [t for t in tickers if abs(float(weights.get(t, 0.0)) - lower) <= tol]
@@ -219,7 +260,7 @@ def _constraint_diagnostics(weights: Dict[str, float], req: OptimizeRequest, tic
         vals = np.array([float(fc.loadings[t]) for t in tickers], dtype=float)
         w = np.array([float(weights.get(t, 0.0)) for t in tickers], dtype=float)
         exposure = float(w @ vals)
-        binding = abs(exposure - float(fc.lower)) <= 1e-3 or abs(exposure - float(fc.upper)) <= 1e-3
+        binding = abs(exposure - float(fc.lower)) <= 1e-5 or abs(exposure - float(fc.upper)) <= 1e-5
         factor_rows.append({'factor': fc.factor, 'exposure': exposure, 'lower': float(fc.lower), 'upper': float(fc.upper), 'binding': bool(binding)})
     return {
         'solver_status': 'optimal',
@@ -229,6 +270,7 @@ def _constraint_diagnostics(weights: Dict[str, float], req: OptimizeRequest, tic
         'binding_upper': binding_upper,
         'factor_constraints': factor_rows,
     }
+
 
 def _scipy_constraints(req: OptimizeRequest, tickers: List[str]):
     cons=[{'type':'eq','fun':lambda w: float(np.sum(w)-1.0)}]
@@ -317,7 +359,7 @@ def _frontier(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: Optimize
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'engine': 'PortfolioOPTIM', 'version': '0.11.4.1', 'auth_required': bool(QUANT_SERVICE_SECRET)}
+    return {'ok': True, 'engine': 'PortfolioOPTIM', 'version': '0.11.4.2', 'auth_required': bool(QUANT_SERVICE_SECRET)}
 
 
 @app.post('/optimize')
@@ -346,7 +388,7 @@ def optimize(req: OptimizeRequest, authorization: Optional[str] = Header(default
             elif req.method == 'efficient_risk':
                 if req.target_volatility is None: raise HTTPException(400, 'target_volatility is required.')
                 ef.efficient_risk(req.target_volatility)
-            weights = dict(ef.clean_weights())
+            weights = _raw_optimizer_weights(ef, list(mu.index))
             perf = _performance(weights, mu, cov, req.risk_free_rate)
 
         elif req.method == 'black_litterman':
@@ -361,7 +403,7 @@ def optimize(req: OptimizeRequest, authorization: Optional[str] = Header(default
             if req.l2_gamma > 0:
                 ef.add_objective(objective_functions.L2_reg, gamma=req.l2_gamma)
             ef.max_sharpe(risk_free_rate=req.risk_free_rate)
-            weights = dict(ef.clean_weights())
+            weights = _raw_optimizer_weights(ef, list(bl_mu.index))
             perf = _performance(weights, bl_mu, bl_cov, req.risk_free_rate)
             perf['prior'] = 'historical mean returns'
             perf['views'] = req.absolute_views
@@ -383,7 +425,7 @@ def optimize(req: OptimizeRequest, authorization: Optional[str] = Header(default
             opt = CLA(mu, cov, weight_bounds=bounds)
             if req.method == 'cla_min_volatility': opt.min_volatility()
             else: opt.max_sharpe()
-            weights = dict(opt.clean_weights())
+            weights = _raw_optimizer_weights(opt, list(mu.index))
             perf = _performance(weights, mu, cov, req.risk_free_rate)
 
         elif req.method == 'min_semivariance':
@@ -416,6 +458,8 @@ def optimize(req: OptimizeRequest, authorization: Optional[str] = Header(default
     except Exception as exc:
         raise HTTPException(422, f'Optimization failed: {exc}')
 
+    benchmarks = _benchmarks(mu, cov, bounds, req.risk_free_rate, req)
+
     return {
         'engine': 'PortfolioOPTIM',
         'method': req.method,
@@ -431,9 +475,10 @@ def optimize(req: OptimizeRequest, authorization: Optional[str] = Header(default
             'risk_model': 'Ledoit-Wolf shrinkage covariance',
             'frequency': 252,
             'comparison_benchmarks_l2_gamma': 0.0,
+            'comparison_evaluator': 'backend_common_evaluator_v0.11.4.2',
         },
         'frontier': _frontier(mu, cov, bounds, req.risk_free_rate, req),
         'factor_exposure': _factor_exposure(weights, req.factor_constraints, list(mu.index)),
-        'benchmarks': _benchmarks(mu, cov, bounds, req.risk_free_rate, req),
+        'benchmarks': benchmarks,
         'constraint_diagnostics': _constraint_diagnostics(weights, req, list(mu.index))
     }
