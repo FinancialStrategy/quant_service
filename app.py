@@ -316,7 +316,7 @@ def _frontier(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: Optimize
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'engine': 'PortfolioOPTIM', 'version': '0.10.9', 'auth_required': bool(QUANT_SERVICE_SECRET)}
+    return {'ok': True, 'engine': 'PortfolioOPTIM', 'version': '0.11.2', 'auth_required': bool(QUANT_SERVICE_SECRET)}
 
 
 @app.post('/optimize')
