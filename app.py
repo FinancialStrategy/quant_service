@@ -12,7 +12,7 @@ from pypfopt.efficient_frontier import EfficientFrontier, EfficientCVaR, Efficie
 from pypfopt.hierarchical_portfolio import HRPOpt
 from pypfopt.cla import CLA
 
-app = FastAPI(title='MK PyPortfolioOpt Service', version='0.10.6')
+app = FastAPI(title='MK PyPortfolioOpt Service', version='0.10.7')
 
 QUANT_SERVICE_SECRET = os.getenv('QUANT_SERVICE_SECRET', '').strip()
 
@@ -144,13 +144,25 @@ def _exact_min_vol(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: Opt
 
 
 def _exact_max_sharpe(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: OptimizeRequest):
+    # Pure constrained tangency portfolio. Deliberately exclude L2 regularization:
+    # once an auxiliary objective is added, the selected portfolio is no longer
+    # guaranteed to be the geometric CML/frontier tangency point.
     ef = EfficientFrontier(mu, cov, weight_bounds=bounds)
     _apply_factor_constraints(ef, req, list(mu.index))
-    if req.l2_gamma > 0:
-        ef.add_objective(objective_functions.L2_reg, gamma=req.l2_gamma)
     ef.max_sharpe(risk_free_rate=rf)
+    # Use the solver's unrounded portfolio performance for the geometric tangency
+    # coordinates. clean_weights() is retained only for display/allocation output;
+    # recomputing performance from rounded weights can move the marker off frontier.
+    ret, vol, sh = ef.portfolio_performance(risk_free_rate=rf)
     weights = dict(ef.clean_weights())
-    return {'weights': weights, 'performance': _performance(weights, mu, cov, rf)}
+    return {
+        'weights': weights,
+        'performance': {
+            'expected_return': float(ret),
+            'volatility': float(vol),
+            'sharpe': float(sh),
+        },
+    }
 
 
 def _black_litterman_benchmark(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: OptimizeRequest):
@@ -248,7 +260,7 @@ def _min_vol_point(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: Opt
     return {'return':float(ret),'volatility':float(vol),'sharpe':float(sh)}
 
 
-def _frontier(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: OptimizeRequest, n_points: int = 45):
+def _frontier(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: OptimizeRequest, n_points: int = 121):
     """Return only the efficient (upper) branch using feasible target returns.
 
     The old implementation scanned from min(mu) to max(mu), which generated many
@@ -283,12 +295,28 @@ def _frontier(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: Optimize
     for p in sorted(pts,key=lambda x:x['volatility']):
         if not out or abs(p['volatility']-out[-1]['volatility'])>1e-6 or abs(p['return']-out[-1]['return'])>1e-6:
             out.append(p)
+
+    # Insert the exact constrained tangency point into the plotted frontier.
+    # This makes the rendered CML touch an actual frontier vertex instead of an
+    # interpolation between nearby target-return solves.
+    try:
+        tan = _exact_max_sharpe(mu, cov, bounds, rf, req)['performance']
+        tp = {'return': float(tan['expected_return']), 'volatility': float(tan['volatility']), 'sharpe': float(tan['sharpe'])}
+        if np.isfinite(tp['return']) and np.isfinite(tp['volatility']):
+            out.append(tp)
+            dedup=[]
+            for p in sorted(out,key=lambda x:x['volatility']):
+                if not dedup or abs(p['volatility']-dedup[-1]['volatility'])>1e-7 or abs(p['return']-dedup[-1]['return'])>1e-7:
+                    dedup.append(p)
+            out=dedup
+    except Exception:
+        pass
     return out
 
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'engine': 'PyPortfolioOpt', 'version': '0.10.6', 'auth_required': bool(QUANT_SERVICE_SECRET)}
+    return {'ok': True, 'engine': 'PyPortfolioOpt', 'version': '0.10.8', 'auth_required': bool(QUANT_SERVICE_SECRET)}
 
 
 @app.post('/optimize')
