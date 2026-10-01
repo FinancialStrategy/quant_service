@@ -12,7 +12,7 @@ from pypfopt.efficient_frontier import EfficientFrontier, EfficientCVaR, Efficie
 from pypfopt.hierarchical_portfolio import HRPOpt
 from pypfopt.cla import CLA
 
-app = FastAPI(title='MK PyPortfolioOpt Service', version='0.10.7')
+app = FastAPI(title='MK PortfolioOPTIM Service', version='0.10.9')
 
 QUANT_SERVICE_SECRET = os.getenv('QUANT_SERVICE_SECRET', '').strip()
 
@@ -316,7 +316,7 @@ def _frontier(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: Optimize
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'engine': 'PyPortfolioOpt', 'version': '0.10.8', 'auth_required': bool(QUANT_SERVICE_SECRET)}
+    return {'ok': True, 'engine': 'PortfolioOPTIM', 'version': '0.10.9', 'auth_required': bool(QUANT_SERVICE_SECRET)}
 
 
 @app.post('/optimize')
@@ -416,7 +416,7 @@ def optimize(req: OptimizeRequest, authorization: Optional[str] = Header(default
         raise HTTPException(422, f'Optimization failed: {exc}')
 
     return {
-        'engine': 'PyPortfolioOpt',
+        'engine': 'PortfolioOPTIM',
         'method': req.method,
         'observations': int(len(prices)),
         'data_start': str(prices.index.min().date()),
