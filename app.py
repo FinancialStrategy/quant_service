@@ -12,7 +12,7 @@ from pypfopt.efficient_frontier import EfficientFrontier, EfficientCVaR, Efficie
 from pypfopt.hierarchical_portfolio import HRPOpt
 from pypfopt.cla import CLA
 
-app = FastAPI(title='MK PortfolioOPTIM Service', version='0.10.9')
+app = FastAPI(title='MK PortfolioOPTIM Service', version='0.11.4.1')
 
 QUANT_SERVICE_SECRET = os.getenv('QUANT_SERVICE_SECRET', '').strip()
 
@@ -176,8 +176,9 @@ def _black_litterman_benchmark(mu: pd.Series, cov: pd.DataFrame, bounds, rf: flo
     bl_cov = bl.bl_cov()
     ef = EfficientFrontier(bl_mu, bl_cov, weight_bounds=bounds)
     _apply_factor_constraints(ef, req, list(bl_mu.index))
-    if req.l2_gamma > 0:
-        ef.add_objective(objective_functions.L2_reg, gamma=req.l2_gamma)
+    # Comparison benchmark is intentionally unregularized so Maximum Sharpe,
+    # Minimum Volatility, Risk Parity and Black-Litterman are not mixed with
+    # different L2 penalties. The selected BL strategy still honors req.l2_gamma.
     ef.max_sharpe(risk_free_rate=rf)
     weights = dict(ef.clean_weights())
     return {'weights': weights, 'performance': _performance(weights, bl_mu, bl_cov, rf)}
@@ -316,7 +317,7 @@ def _frontier(mu: pd.Series, cov: pd.DataFrame, bounds, rf: float, req: Optimize
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'engine': 'PortfolioOPTIM', 'version': '0.10.9', 'auth_required': bool(QUANT_SERVICE_SECRET)}
+    return {'ok': True, 'engine': 'PortfolioOPTIM', 'version': '0.11.4.1', 'auth_required': bool(QUANT_SERVICE_SECRET)}
 
 
 @app.post('/optimize')
@@ -424,6 +425,13 @@ def optimize(req: OptimizeRequest, authorization: Optional[str] = Header(default
         'weights': weights,
         'performance': perf,
         'expected_returns': {k: float(v) for k,v in mu.items()},
+        'covariance': {r: {c: float(cov.loc[r, c]) for c in cov.columns} for r in cov.index},
+        'model_spec': {
+            'expected_return_model': 'mean_historical_return',
+            'risk_model': 'Ledoit-Wolf shrinkage covariance',
+            'frequency': 252,
+            'comparison_benchmarks_l2_gamma': 0.0,
+        },
         'frontier': _frontier(mu, cov, bounds, req.risk_free_rate, req),
         'factor_exposure': _factor_exposure(weights, req.factor_constraints, list(mu.index)),
         'benchmarks': _benchmarks(mu, cov, bounds, req.risk_free_rate, req),
