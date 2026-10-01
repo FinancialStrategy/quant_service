@@ -1,8 +1,24 @@
-# MK PortfolioOPTIM Quant Service
+# MK PortfolioOPTIM Quant Service — v0.13.0
 
-This service is intentionally separated from the Netlify front-end/runtime. Netlify serves the public application and proxies optimization requests to a Python service configured with `PORTFOLIOOPTIM_API_URL`.
+Secure Python analytical backend for MK Institutional Investment Intelligence. Netlify serves the public application and proxies requests to this service through `PORTFOLIOOPTIM_API_URL`; browser clients do not require the backend URL or secret.
 
-Supported methods: max Sharpe, minimum volatility, quadratic utility, efficient return/risk, HRP, CLA, minimum semivariance, minimum CVaR and minimum CDaR.
+## Core optimization
+Maximum Sharpe / Tangency, Minimum Volatility, Efficient Return/Risk, Quadratic Utility, Black–Litterman, Risk Parity, HRP, CLA, Minimum Semivariance, Minimum CVaR and Minimum CDaR.
+
+## v0.13 institutional extensions
+- Expected-return model selector: historical mean, EMA, CAPM proxy.
+- Covariance selector: Ledoit–Wolf, sample, EWMA.
+- Factor/group/region/asset-class constraints, minimum Effective N, turnover, tracking error and liquidity capacity.
+- Common-model risk decomposition and constraint diagnostics.
+- Portfolio-level walk-forward/OOS endpoint.
+- Robustness/model-grid/bootstrap endpoint with resampled exact-frontier envelope.
+- Black–Litterman absolute/relative views, confidence and tau.
+
+## Endpoints
+- `GET /health`
+- `POST /optimize`
+- `POST /walkforward`
+- `POST /robustness`
 
 Run locally:
 

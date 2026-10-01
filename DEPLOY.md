@@ -1,18 +1,22 @@
-# MK Quant Optimizer deployment
+# PortfolioOPTIM v0.13.0 — Render deployment
 
-The frontend remains on Netlify. The Python service can run on Railway, Render, or any Docker-compatible host.
+Deploy the contents of `quant_service/` to the `FinancialStrategy/quant_service` repository.
 
-## Required service environment variable
-- `QUANT_SERVICE_SECRET`: create a long random secret. The `/optimize` endpoint requires it when configured.
+Required Render environment variable:
+- `QUANT_SERVICE_SECRET`
 
-## Netlify environment variables
-- `PORTFOLIOOPTIM_API_URL`: public base URL of this service, without `/optimize`.
-- `QUANT_SERVICE_SECRET`: same secret as the Python service.
+Start command is defined by the Dockerfile/render configuration. After deploy, verify:
 
-The browser calls only `/api/optimizer`. Netlify adds the bearer secret server-side.
+`https://quant-service-ozki.onrender.com/health`
 
-## Render free test route
-Create a Web Service from `quant_service/`, choose Docker and Free, set `QUANT_SERVICE_SECRET`, deploy, then copy the service URL into Netlify `PORTFOLIOOPTIM_API_URL`.
+Expected identity:
 
-## Railway route
-Deploy `quant_service/` using its Dockerfile, set `QUANT_SERVICE_SECRET`, then copy its public service URL into Netlify `PORTFOLIOOPTIM_API_URL`.
+```json
+{"ok":true,"engine":"PortfolioOPTIM","version":"0.13.0","auth_required":true}
+```
+
+Netlify must use the same secret and:
+- `PORTFOLIOOPTIM_API_URL=https://quant-service-ozki.onrender.com`
+- `QUANT_SERVICE_SECRET=<same secret>`
+
+The underlying Python library package names are implementation details and are not part of the public PortfolioOPTIM product identity.
